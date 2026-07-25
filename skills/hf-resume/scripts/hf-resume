@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# hf-resume — resumable Hugging Face downloads + a native Swift progress window.
+#
+# The downloader runs detached: it survives this command returning, the window closing,
+# and the shell/session going away. Every subcommand is safe to run while it downloads.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${HF_RESUME_HOME:-$HOME/.cache/hf-resume}"
+RUNS="$ROOT/runs"
+BIN="$ROOT/bin"
+mkdir -p "$RUNS" "$BIN"
+
+die() { printf 'hf-resume: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+py() { python3 "$@"; }
+
+slugify() { # <type> <repo> [local-dir]
+  local s="$1--${2//\//--}"
+  [ -n "${3:-}" ] && s="$s--$(printf '%s' "$3" | shasum | cut -c1-8)"
+  printf '%s' "$s"
+}
+
+latest_run() {
+  local newest="" t=0 d
+  for d in "$RUNS"/*/; do
+    [ -f "$d/state.json" ] || continue
+    local m; m=$(stat -f %m "$d/state.json" 2>/dev/null || echo 0)
+    if [ "$m" -gt "$t" ]; then t=$m; newest="${d%/}"; fi
+  done
+  [ -n "$newest" ] || die "no runs yet — start one with: hf-resume pull <repo>"
+  printf '%s' "$newest"
+}
+
+resolve_run() { # [slug-or-repo]
+  if [ -z "${1:-}" ]; then latest_run; return; fi
+  local d
+  for d in "$RUNS/$1" "$RUNS/model--${1//\//--}" "$RUNS/dataset--${1//\//--}"; do
+    [ -f "$d/state.json" ] && { printf '%s' "$d"; return; }
+  done
+  # fall back to a unique substring match
+  local hits=() ; for d in "$RUNS"/*/; do case "${d%/}" in *"${1//\//--}"*) hits+=("${d%/}");; esac; done
+  [ "${#hits[@]}" -eq 1 ] || die "no unique run matching '$1' (try: hf-resume list)"
+  printf '%s' "${hits[0]}"
+}
+
+alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+# The pid we launch is `uv`, but the real downloader is its python child, which calls
+# os.setsid() to survive process-group kills. state.json carries that pid, so it wins.
+run_pid() { # <run-dir>
+  local d="$1" p=""
+  [ -f "$d/state.json" ] && p=$(py -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("pid") or "")
+except Exception: print("")' "$d/state.json" 2>/dev/null || true)
+  [ -z "$p" ] && [ -f "$d/pid" ] && p=$(cat "$d/pid" 2>/dev/null || true)
+  printf '%s' "$p"
+}
+
+# --- window ------------------------------------------------------------------------------
+
+window_bin() {
+  have swiftc || die "swiftc not found — install Xcode command line tools (xcode-select --install)"
+  local src="$HERE/Window.swift"
+  local h; h=$(shasum "$src" | cut -c1-12)
+  local out="$BIN/window-$h"
+  if [ ! -x "$out" ]; then
+    printf 'hf-resume: compiling progress window (once per version)…\n' >&2
+    # No -parse-as-library: Window.swift is top-level code that builds its NSWindow explicitly.
+    swiftc -O "$src" -o "$out" >&2
+  fi
+  printf '%s' "$out"
+}
+
+open_window() { # <state.json>
+  local bin; bin=$(window_bin)
+  nohup "$bin" "$1" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# --- pull --------------------------------------------------------------------------------
+
+cmd_pull() {
+  local repo="" type="model" revision="" local_dir="" cache_dir="" endpoint="" workers=4 tries=200 window=1 verbose=0
+  local -a inc=() exc=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verbose) verbose=1; shift;;
+      --type) type="$2"; shift 2;;
+      --revision) revision="$2"; shift 2;;
+      --include) inc+=("$2"); shift 2;;
+      --exclude) exc+=("$2"); shift 2;;
+      --local-dir) local_dir="$2"; shift 2;;
+      --cache-dir) cache_dir="$2"; shift 2;;
+      --endpoint) endpoint="$2"; shift 2;;
+      --workers) workers="$2"; shift 2;;
+      --max-tries) tries="$2"; shift 2;;
+      --no-window) window=0; shift;;
+      --window) window=1; shift;;
+      -h|--help) usage; exit 0;;
+      -*) die "unknown flag: $1";;
+      *) [ -z "$repo" ] && repo="$1" || die "unexpected argument: $1"; shift;;
+    esac
+  done
+  [ -n "$repo" ] || die "usage: hf-resume pull <repo-id> [--type model|dataset] [--include GLOB] …"
+  have uv || die "uv not found — install it: brew install uv"
+
+  local slug run; slug=$(slugify "$type" "$repo" "$local_dir"); run="$RUNS/$slug"
+  mkdir -p "$run"
+  local state="$run/state.json" log="$run/downloader.log" pidf="$run/pid"
+
+  local existing; existing=$(run_pid "$run")
+  if alive "$existing"; then
+    printf 'already downloading %s (pid %s)\n' "$repo" "$existing"
+    [ "$window" = 1 ] && open_window "$state"
+    printf 'state: %s\n' "$state"
+    exit 0
+  fi
+
+  local -a args=(--repo "$repo" --type "$type" --workers "$workers" --max-tries "$tries" --state "$state")
+  [ -n "$revision" ] && args+=(--revision "$revision")
+  [ -n "$local_dir" ] && args+=(--local-dir "$local_dir")
+  [ -n "$cache_dir" ] && args+=(--cache-dir "$cache_dir")
+  [ -n "$endpoint" ] && args+=(--endpoint "$endpoint")
+  [ "$verbose" = 1 ] && args+=(--verbose)
+  local g; for g in ${inc+"${inc[@]}"}; do args+=(--include "$g"); done
+  for g in ${exc+"${exc[@]}"}; do args+=(--exclude "$g"); done
+
+  : > "$log"
+  nohup uv run --script "$HERE/downloader.py" "${args[@]}" >>"$log" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$pidf"
+  disown 2>/dev/null || true
+
+  printf 'started %s (pid %d)\n' "$repo" "$pid"
+  printf '  state : %s\n  log   : %s\n' "$state" "$log"
+
+  # Give uv a moment to resolve the pinned env and publish first state.
+  local i
+  for i in $(seq 30); do [ -f "$state" ] && break; sleep 1; alive "$pid" || break; done
+  if ! alive "$pid" && [ ! -f "$state" ]; then
+    printf '\ndownloader exited early:\n' >&2; tail -20 "$log" >&2; exit 1
+  fi
+  [ "$window" = 1 ] && open_window "$state"
+  printf '  check : hf-resume status\n'
+}
+
+# --- status / list / stop -----------------------------------------------------------------
+
+cmd_status() {
+  local run; run=$(resolve_run "${1:-}")
+  [ -f "$run/state.json" ] || die "no state yet in $run"
+  local pid; pid=$(run_pid "$run")
+  HF_RESUME_PID="$pid" py - "$run/state.json" <<'PY'
+import json, os, sys, time
+s = json.load(open(sys.argv[1]))
+def hb(n):
+    n = n or 0
+    for u, d in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= d: return f"{n/d:.2f} {u}"
+    return f"{n} B"
+tot, done = s.get("total_bytes") or 0, s.get("done_bytes") or 0
+pct = (done / tot * 100) if tot else 0
+sp = s.get("speed_bps") or 0
+eta = s.get("eta_seconds")
+pid = os.environ.get("HF_RESUME_PID") or "?"
+alive = False
+try: os.kill(int(pid), 0); alive = True
+except Exception: pass
+bar_w = 32
+filled = int(bar_w * pct / 100)
+print(f"{s.get('repo_id')}  [{s.get('status')}]" + (f"  attempt {s['attempt']}" if (s.get('attempt') or 1) > 1 else ""))
+print(f"  [{'#'*filled}{'.'*(bar_w-filled)}] {pct:5.1f}%  {hb(done)} / {hb(tot)}")
+print(f"  speed {sp/1e6:.2f} MB/s   ETA {'—' if not eta else f'{int(eta)//60}m {int(eta)%60}s'}   daemon {'running' if alive else 'not running'} (pid {pid})")
+if s.get("resumed_bytes"): print(f"  resumed from {hb(s['resumed_bytes'])} already on disk")
+files = s.get("files") or []
+act = [f for f in files if f.get("state") == "active"]
+q   = [f for f in files if f.get("state") == "queued"]
+d   = [f for f in files if f.get("state") == "done"]
+if act:
+    print(f"  downloading ({len(act)}):")
+    for f in sorted(act, key=lambda f: -(f.get('done') or 0)):
+        fp = (f.get('done') or 0) / (f['size'] or 1) * 100
+        print(f"    {fp:5.1f}%  {(f.get('speed_bps') or 0)/1e6:5.2f} MB/s  {f['path']}")
+if q:
+    print(f"  queued ({len(q)}): " + ", ".join(f["path"] for f in q[:6]) + (" …" if len(q) > 6 else ""))
+print(f"  complete ({len(d)}/{len(files)})")
+if s.get("error"): print(f"  error: {s['error']}")
+for n in s.get("notes") or []: print(f"  note: {n}")
+print(f"  dest: {s.get('dest')}")
+PY
+}
+
+cmd_list() {
+  local d found=0
+  for d in "$RUNS"/*/; do
+    [ -f "$d/state.json" ] || continue
+    found=1
+    py - "$d" <<'PY'
+import json, os, sys
+run = sys.argv[1].rstrip("/")
+s = json.load(open(os.path.join(run, "state.json")))
+pid = str(s.get("pid") or "")
+if not pid:
+    p = os.path.join(run, "pid")
+    if os.path.exists(p): pid = open(p).read().strip()
+alive = False
+try: os.kill(int(pid), 0); alive = True
+except Exception: pass
+tot, done = s.get("total_bytes") or 0, s.get("done_bytes") or 0
+pct = (done/tot*100) if tot else 0
+print(f"{s.get('status','?'):9} {pct:5.1f}%  {'running' if alive else '-':7}  {s.get('repo_id')}  ({os.path.basename(run)})")
+PY
+  done
+  [ "$found" = 1 ] || echo "no runs yet"
+}
+
+cmd_stop() {
+  local run; run=$(resolve_run "${1:-}")
+  local pid; pid=$(run_pid "$run")
+  [ -n "$pid" ] || die "no pid recorded in $run"
+  if alive "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    alive "$pid" && kill -9 "$pid" 2>/dev/null || true
+    printf 'stopped pid %s — partials kept, rerun the same pull to resume\n' "$pid"
+  else
+    printf 'not running (pid %s)\n' "$pid"
+  fi
+}
+
+cmd_window() { local run; run=$(resolve_run "${1:-}"); open_window "$run/state.json"; printf 'window opened for %s\n' "$(basename "$run")"; }
+
+# --- verify / doctor ---------------------------------------------------------------------
+
+cmd_verify() {
+  have hf || die "verify needs the modern 'hf' CLI (curl -LsSf https://hf.co/cli/install.sh | bash -s)"
+  local repo="${1:-}"; shift || true
+  [ -n "$repo" ] || die "usage: hf-resume verify <repo-id> [--type dataset] [--local-dir DIR]"
+  printf 'verifying checksums via hf cache verify…\n'
+  hf cache verify "$repo" "$@"
+}
+
+cmd_doctor() {
+  printf '== hf-resume doctor ==\n'
+  printf '%-22s %s\n' "uv" "$(have uv && uv --version || echo 'MISSING (brew install uv)')"
+  printf '%-22s %s\n' "swiftc" "$(have swiftc && swiftc --version 2>&1 | head -1 || echo 'MISSING (xcode-select --install)')"
+  printf '%-22s %s\n' "hf (for verify)" "$(have hf && hf version 2>&1 | head -1 || echo 'absent (optional)')"
+
+  local ep="${HF_ENDPOINT:-}"
+  if [ -z "$ep" ]; then
+    printf '%-22s %s\n' "HF_ENDPOINT" "unset (good)"
+  elif [[ "$ep" == *huggingface.co* ]]; then
+    printf '%-22s %s\n' "HF_ENDPOINT" "$ep (ok)"
+  else
+    printf '%-22s %s\n' "HF_ENDPOINT" "$ep  <-- IGNORED by hf-resume"
+    printf '%-22s %s\n' "" "mirrors that 308-redirect to huggingface.co break metadata resolution."
+    grep -ns 'HF_ENDPOINT' "$HOME/.zshrc" 2>/dev/null | sed 's/^/                       .zshrc:/' || true
+  fi
+  [ -n "${HF_HUB_ENABLE_HF_TRANSFER:-}" ] && printf '%-22s %s\n' "HF_HUB_ENABLE_HF_TRANSFER" "set  <-- IGNORED (hf_transfer cannot resume)"
+
+  local cache="${HF_HUB_CACHE:-$HOME/.cache/huggingface/hub}"
+  printf '%-22s %s\n' "cache" "$cache"
+  printf '%-22s %s\n' "disk free" "$(df -h "$cache" 2>/dev/null | awk 'NR==2{print $4" free of "$2}')"
+
+  # Orphan partials written by modern hf (random suffix) can never be resumed by anything.
+  local orphans; orphans=$(find "$cache" -name '*.*.incomplete' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${orphans:-0}" -gt 0 ]; then
+    local sz; sz=$(find "$cache" -name '*.*.incomplete' -exec stat -f %z {} \; 2>/dev/null | awk '{s+=$1} END{printf "%.2f GB", s/1e9}')
+    printf '%-22s %s\n' "orphan partials" "$orphans files, $sz — unusable (random-suffix). Reclaim: hf cache prune"
+  else
+    printf '%-22s %s\n' "orphan partials" "none"
+  fi
+  printf '%-22s %s\n' "runs" "$RUNS"
+}
+
+usage() {
+  cat <<'EOF'
+hf-resume — Hugging Face downloads that actually resume, with a native progress window.
+
+  hf-resume pull <repo-id> [options]     start (detached) + open the window
+  hf-resume status [repo|slug]           text progress for a run (default: most recent)
+  hf-resume window [repo|slug]           re-open the progress window
+  hf-resume stop [repo|slug]             stop the daemon; partials kept and resumable
+  hf-resume list                         all runs
+  hf-resume verify <repo-id> [...]       checksum-verify what landed (via `hf cache verify`)
+  hf-resume doctor                       environment sanity check
+
+pull options
+  --type model|dataset|space   default: model
+  --revision REV               branch, tag or commit
+  --include GLOB               repeatable, e.g. --include '*.safetensors'
+  --exclude GLOB               repeatable
+  --local-dir DIR              flat layout instead of the HF cache
+  --cache-dir DIR              override the HF cache location
+  --endpoint URL               force an endpoint/mirror (otherwise a redirecting
+                               HF_ENDPOINT is ignored — see `hf-resume doctor`)
+  --workers N                  concurrent files (default 4; each file stays single-stream)
+  --max-tries N                retry rounds (default 200; resume makes retries cheap)
+  --no-window                  headless
+  --verbose                    huggingface_hub debug logs into downloader.log
+
+Notes
+  * Downloads run through a pinned huggingface_hub==1.16.4 (via uv) because newer versions
+    deliberately cannot resume across runs.
+  * Xet, hf_transfer and non-huggingface.co mirrors are force-disabled — each one breaks
+    either resume or correctness. `hf-resume doctor` explains what it ignored.
+EOF
+}
+
+case "${1:-}" in
+  pull)    shift; cmd_pull "$@";;
+  status)  shift; cmd_status "${1:-}";;
+  window)  shift; cmd_window "${1:-}";;
+  stop)    shift; cmd_stop "${1:-}";;
+  list)    shift; cmd_list;;
+  verify)  shift; cmd_verify "$@";;
+  doctor)  shift; cmd_doctor;;
+  ""|-h|--help|help) usage;;
+  *) die "unknown command: $1 (try: hf-resume --help)";;
+esac
