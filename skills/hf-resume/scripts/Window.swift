@@ -37,6 +37,7 @@ struct FileRow: Codable, Identifiable, Equatable {
 struct Snapshot: Codable, Equatable {
     var repo_id: String?
     var repo_type: String?
+    var source: String?
     var dest: String?
     var status: String?
     var error: String?
@@ -226,6 +227,13 @@ struct RootView: View {
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .lineLimit(1).truncationMode(.middle)
                 StatusPill(status: model.snap.status ?? "…")
+                if let s = model.snap.source, !s.isEmpty {
+                    Text("via \(s)")
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(.quaternary, in: Capsule())
+                        .foregroundStyle(.secondary)
+                }
                 if let a = model.snap.attempt, a > 1 {
                     Text("attempt \(a)").font(.system(size: 10)).foregroundStyle(.orange)
                 }

@@ -24,17 +24,33 @@ model at 90% and you download all 17 GB again.
 - Runs **detached** (`os.setsid()`): survives the command returning, the window closing, the
   terminal going away, and its launcher being killed.
 - **Retries forever by default** — resume makes a retry nearly free, so a flaky link eventually
-  finishes instead of starting over.
+  finishes instead of starting over (but bails after 5 consecutive zero-progress attempts, so a
+  broken endpoint fails fast instead of spinning for an hour).
+- **Picks its source by measurement**: direct HuggingFace when reachable at ≥2 MB/s, otherwise
+  the **ModelScope** mirror. Both fill the *same* cache — see below.
 
 ```bash
-hf-resume pull mlx-community/flux2-klein-9b-8bit    # detached + window
+hf-resume pull mlx-community/flux2-klein-9b-8bit    # detached + window, source auto-picked
+hf-resume pull <repo> --modelscope                  # force the CN mirror (--hf forces direct)
 hf-resume status                                    # progress in text
 hf-resume stop                                      # partials stay resumable
 hf-resume verify <repo>                             # checksum what landed
-hf-resume doctor                                    # environment sanity check
+hf-resume doctor [repo]                             # env check + which source it picks, and why
 ```
 
 Re-running the same `pull` is how you resume.
+
+## Direct or mirror — decided by measuring, not by looking at proxy settings
+
+Clash/mihomo in **TUN mode** routes at the network layer: `scutil --proxy` reports
+`HTTPEnable: 0` and no proxy env vars exist, while `huggingface.co` is in fact fast. So
+"is a proxy configured?" answers *no* in exactly the case where direct is correct. hf-resume
+probes throughput instead and logs the proxy signals only as explanation.
+
+**Both sources fill one cache.** The HF cache names each LFS blob by its sha256, and ModelScope
+publishes the same sha256 for the same repo (verified byte-identical; non-LFS files get their
+git-blob-sha1 computed locally). So ModelScope bytes *are* valid HF cache blobs — after a
+ModelScope pull, an `--hf` pull of the same repo finishes in seconds and re-downloads nothing.
 
 ## Three ways to corrupt a Hugging Face download (all avoided here)
 

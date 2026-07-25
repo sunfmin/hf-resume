@@ -1,6 +1,6 @@
 ---
 name: hf-resume
-description: Get a Hugging Face model or dataset onto local disk — the default way to download ANY HF repo, replacing plain `hf download` / `snapshot_download`. Use whenever the user wants weights or data fetched: "下载 <repo-id> 这个模型", "把这个模型/数据集拉下来", "download <org/name> from HuggingFace", "get the weights for X onto my disk", "pull this repo", "grab this checkpoint" — and especially when a download broke partway and must continue: "下到一半断了，接着下", "续传不管用", "it downloaded several GB and started over", "resume the interrupted download". Multi-GB repos and interrupted downloads are the core case. Downloads via a pinned huggingface_hub==1.16.4 run by uv (newer versions cannot resume across runs) and opens a native macOS Swift progress window with an overall bar, speed, ETA, the full file list, and per-file live progress. NOT for `hf auth`/upload/repo admin or the `hf` subcommand reference (that is hf-cli), NOT for downloading a plain URL/tarball/release asset/video (that is filetransfer), NOT for choosing which model to use (huggingface-best) or estimating its memory (hf-mem).
+description: Get a Hugging Face model or dataset onto local disk — the default way to download ANY HF repo, replacing plain `hf download` / `snapshot_download`. Use whenever the user wants weights or data fetched: "下载 <repo-id> 这个模型", "把这个模型/数据集拉下来", "download <org/name> from HuggingFace", "get the weights for X onto my disk", "pull this repo", "grab this checkpoint" — and especially when a download broke partway and must continue: "下到一半断了，接着下", "续传不管用", "it downloaded several GB and started over", "resume the interrupted download". Multi-GB repos and interrupted downloads are the core case. Downloads via a pinned huggingface_hub==1.16.4 run by uv (newer versions cannot resume across runs) and opens a native macOS Swift progress window with an overall bar, speed, ETA, the full file list, and per-file live progress. Also picks the source automatically — direct HuggingFace when it is reachable and fast (e.g. a proxy/VPN is up), the ModelScope mirror when it is not (走直连 or 走国内镜像) — so it keeps working with or without a proxy. NOT for `hf auth`/upload/repo admin or the `hf` subcommand reference (that is hf-cli), NOT for downloading a plain URL/tarball/release asset/video (that is filetransfer), NOT for choosing which model to use (huggingface-best) or estimating its memory (hf-mem).
 ---
 
 # hf-resume
@@ -19,15 +19,16 @@ that opens a deterministic `<etag>.incomplete` and passes `resume_size` to `http
 ```bash
 S=~/.claude/skills/hf-resume/scripts/hf-resume     # or wherever this skill is installed
 
-$S pull mlx-community/flux2-klein-9b-8bit          # detached + window opens
+$S pull mlx-community/flux2-klein-9b-8bit          # detached + window; source auto-picked
 $S pull Qwen/Qwen3-8B --include '*.safetensors' --workers 4
 $S pull HuggingFaceFW/fineweb --type dataset --local-dir ./fineweb
+$S pull <repo> --modelscope   # force the CN mirror  (--hf forces direct)
 $S status            # text progress (any time, any shell)
 $S window            # re-open the window
 $S stop              # stop; partials stay resumable
 $S list              # every run
 $S verify <repo>     # checksum-verify what landed
-$S doctor            # environment sanity check
+$S doctor [repo]     # environment check + which source it would pick, and why
 ```
 
 Re-running the **same `pull`** is how you resume. It is idempotent: finished files are skipped,
@@ -39,6 +40,27 @@ repo id with no path juggling. `--local-dir` gives a flat copy instead.
 
 The daemon is **detached**: it keeps running after the command returns, after the window is
 closed, and after this session ends. `status` and `window` reattach to it.
+
+## Sources: direct or ModelScope, and why the choice is measured
+
+`--source auto` (default) probes direct HuggingFace and uses it whenever it is reachable at
+≥2 MB/s. Only when HF is unreachable or crawling does it probe **ModelScope** and switch.
+Override with `--hf` / `--modelscope`, or `hf-resume doctor <repo>` to see the decision.
+
+**Do not try to detect the proxy instead.** Clash/mihomo in TUN mode routes at the network
+layer: `scutil --proxy` reports `HTTPEnable: 0` and no proxy env vars exist, while
+huggingface.co is in fact fast. Config-based detection reports "no proxy" exactly when direct
+is the right answer. Proxy signals are logged as *explanation*; the measurement decides.
+
+Short probes are noisy in both directions — TCP slow start undershoots (a 3 MB read measured
+1.2 MB/s on a link sustaining 8 MB/s), a warm CDN edge overshoots. So the probe skips its
+first 1.5 MB and its verdict is only ever "usable vs not", never a close race.
+
+**Either source fills the same cache.** For LFS files the HF cache names each blob by its
+sha256, and ModelScope publishes the same sha256 for the same repo (verified byte-identical,
+and non-LFS files get their git-blob-sha1 computed locally). So ModelScope bytes are valid HF
+blobs: after a ModelScope pull, an `--hf` pull of the same repo finishes in seconds and
+re-downloads nothing — measured, with the blob's mtime unchanged. Switch freely.
 
 ## Rules — each one is a bug someone already shipped
 

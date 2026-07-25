@@ -82,7 +82,8 @@ open_window() { # <state.json>
 # --- pull --------------------------------------------------------------------------------
 
 cmd_pull() {
-  local repo="" type="model" revision="" local_dir="" cache_dir="" endpoint="" workers=4 tries=200 window=1 verbose=0
+  local repo="" type="model" revision="" local_dir="" cache_dir="" endpoint="" source="auto"
+  local workers=4 tries=200 window=1 verbose=0
   local -a inc=() exc=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -94,6 +95,9 @@ cmd_pull() {
       --local-dir) local_dir="$2"; shift 2;;
       --cache-dir) cache_dir="$2"; shift 2;;
       --endpoint) endpoint="$2"; shift 2;;
+      --source) source="$2"; shift 2;;
+      --hf) source="hf"; shift;;
+      --modelscope|--ms) source="modelscope"; shift;;
       --workers) workers="$2"; shift 2;;
       --max-tries) tries="$2"; shift 2;;
       --no-window) window=0; shift;;
@@ -118,7 +122,8 @@ cmd_pull() {
     exit 0
   fi
 
-  local -a args=(--repo "$repo" --type "$type" --workers "$workers" --max-tries "$tries" --state "$state")
+  local -a args=(--repo "$repo" --type "$type" --workers "$workers" --max-tries "$tries" \
+                 --source "$source" --state "$state")
   [ -n "$revision" ] && args+=(--revision "$revision")
   [ -n "$local_dir" ] && args+=(--local-dir "$local_dir")
   [ -n "$cache_dir" ] && args+=(--cache-dir "$cache_dir")
@@ -243,6 +248,7 @@ cmd_verify() {
 }
 
 cmd_doctor() {
+  local probe_repo="${1:-}"
   printf '== hf-resume doctor ==\n'
   printf '%-22s %s\n' "uv" "$(have uv && uv --version || echo 'MISSING (brew install uv)')"
   printf '%-22s %s\n' "swiftc" "$(have swiftc && swiftc --version 2>&1 | head -1 || echo 'MISSING (xcode-select --install)')"
@@ -273,6 +279,18 @@ cmd_doctor() {
     printf '%-22s %s\n' "orphan partials" "none"
   fi
   printf '%-22s %s\n' "runs" "$RUNS"
+
+  # Proxy config is NOT a usable signal: Clash/mihomo in TUN mode routes at the network layer,
+  # so scutil reports no proxy while huggingface.co is in fact fast. Only measurement decides.
+  printf '\n-- source probe (measured, not inferred) --\n'
+  local pr="${probe_repo:-openai-community/gpt2}"
+  printf '%-22s %s\n' "probe repo" "$pr"
+  if have uv; then
+    uv run -q --script "$HERE/downloader.py" --repo "$pr" --probe 2>&1 \
+      | sed 's/^\[env\] /                       /; s/^\[probe\] /  decision:            /'
+  else
+    printf '%-22s %s\n' "" "uv missing — cannot probe"
+  fi
 }
 
 usage() {
@@ -285,7 +303,7 @@ hf-resume — Hugging Face downloads that actually resume, with a native progres
   hf-resume stop [repo|slug]             stop the daemon; partials kept and resumable
   hf-resume list                         all runs
   hf-resume verify <repo-id> [...]       checksum-verify what landed (via `hf cache verify`)
-  hf-resume doctor                       environment sanity check
+  hf-resume doctor [repo-id]             environment sanity check + source probe
 
 pull options
   --type model|dataset|space   default: model
@@ -296,6 +314,8 @@ pull options
   --cache-dir DIR              override the HF cache location
   --endpoint URL               force an endpoint/mirror (otherwise a redirecting
                                HF_ENDPOINT is ignored — see `hf-resume doctor`)
+  --source auto|hf|modelscope  where to fetch from (default auto: measures both and takes
+                               the faster reachable one). Shorthands: --hf, --modelscope
   --workers N                  concurrent files (default 4; each file stays single-stream)
   --max-tries N                retry rounds (default 200; resume makes retries cheap)
   --no-window                  headless
@@ -316,7 +336,7 @@ case "${1:-}" in
   stop)    shift; cmd_stop "${1:-}";;
   list)    shift; cmd_list;;
   verify)  shift; cmd_verify "$@";;
-  doctor)  shift; cmd_doctor;;
+  doctor)  shift; cmd_doctor "${1:-}";;
   ""|-h|--help|help) usage;;
   *) die "unknown command: $1 (try: hf-resume --help)";;
 esac
