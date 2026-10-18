@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["huggingface_hub==1.16.4"]
+# dependencies = ["huggingface_hub==1.16.4", "socksio"]  # socksio: httpx needs it when all_proxy=socks5://
 # ///
 """hf-resume downloader — resumable HF/ModelScope repo download with a JSON progress feed.
 
